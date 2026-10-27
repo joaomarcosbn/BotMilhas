@@ -1,10 +1,14 @@
 """Extração e filtragem de ofertas de milhas a partir de feeds RSS.
 
 Camadas (cada uma testável isoladamente):
-    fetch_feed()      -> I/O de rede (retorna bytes)
-    parse_offers()    -> função pura: conteúdo XML -> ofertas filtradas
-    get_offers()      -> orquestra um feed
+    fetch_feed()            -> I/O de rede (retorna bytes)
+    parse_offers()          -> função pura: conteúdo XML -> ofertas filtradas
+    get_offers()            -> orquestra um feed
     get_offers_from_feeds() -> orquestra vários feeds, com isolamento de falhas
+
+Regra de filtragem (duas camadas): o título precisa conter
+    1) um PROGRAMA (Livelo, Smiles, Itaú...) E
+    2) uma AÇÃO/CONTEXTO (bônus, transferência, compra, desconto...).
 """
 from __future__ import annotations
 
@@ -28,7 +32,7 @@ _EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 
 
 class Offer(TypedDict):
-    id: str                    # hash estável do link (útil como ID no Firestore)
+    id: str                     # hash SHA-1 estável do link (ID do documento no Firestore)
     title: str
     link: str
     published: datetime | None  # timezone-aware (UTC) ou None se o feed não informar
@@ -39,7 +43,7 @@ class FeedError(Exception):
 
 
 # --------------------------------------------------------------------------- #
-# Utilidades de texto
+# Utilidades de texto e filtro
 # --------------------------------------------------------------------------- #
 def normalize(text: str) -> str:
     """Remove acentos e aplica casefold: 'Itaú' -> 'itau', 'BÔNUS' -> 'bonus'."""
@@ -51,8 +55,8 @@ def normalize(text: str) -> str:
 def build_keyword_pattern(keywords: Iterable[str]) -> re.Pattern[str]:
     """Compila um regex que casa o *início* de qualquer palavra-chave.
 
-    Usa \\b só no começo para que 'transferencia' case 'transferências'
-    e 'esfera' case 'Esferas', sem casar no meio de outra palavra.
+    \\b só no começo: 'transferencia' casa 'transferências' e 'esfera' casa
+    'Esferas', mas nada casa no meio de outra palavra.
     """
     terms = [re.escape(normalize(k.strip())) for k in keywords if k and k.strip()]
     if not terms:
@@ -62,6 +66,16 @@ def build_keyword_pattern(keywords: Iterable[str]) -> re.Pattern[str]:
 
 def matches_keywords(text: str, pattern: re.Pattern[str]) -> bool:
     return bool(pattern.search(normalize(text)))
+
+
+def matches_offer(
+    text: str,
+    programs_pattern: re.Pattern[str],
+    actions_pattern: re.Pattern[str],
+) -> bool:
+    """Validação em duas camadas: precisa de um programa E de uma ação."""
+    normalized = normalize(text)
+    return bool(programs_pattern.search(normalized)) and bool(actions_pattern.search(normalized))
 
 
 # --------------------------------------------------------------------------- #
@@ -99,11 +113,13 @@ def _make_id(link: str) -> str:
 
 def parse_offers(
     content: bytes | str,
-    keywords: Iterable[str] | None = None,
+    programs: Iterable[str] | None = None,
+    actions: Iterable[str] | None = None,
     limit: int = config.MAX_ENTRIES,
 ) -> list[Offer]:
-    """Interpreta o XML do feed e devolve só as entradas cujo título casa com as keywords."""
-    pattern = build_keyword_pattern(keywords or config.KEYWORDS)
+    """Interpreta o XML do feed e devolve só entradas com programa E ação no título."""
+    programs_pattern = build_keyword_pattern(programs or config.PROGRAMS)
+    actions_pattern = build_keyword_pattern(actions or config.ACTIONS)
     parsed = feedparser.parse(content)
 
     if parsed.bozo and not parsed.entries:
@@ -115,7 +131,7 @@ def parse_offers(
         link = (entry.get("link") or "").strip()
         if not title or not link:
             continue
-        if not matches_keywords(title, pattern):
+        if not matches_offer(title, programs_pattern, actions_pattern):
             continue
         offers.append(
             Offer(
@@ -133,20 +149,22 @@ def parse_offers(
 # --------------------------------------------------------------------------- #
 def get_offers(
     feed_url: str,
-    keywords: Iterable[str] | None = None,
+    programs: Iterable[str] | None = None,
+    actions: Iterable[str] | None = None,
     limit: int = config.MAX_ENTRIES,
     timeout: float = config.REQUEST_TIMEOUT,
 ) -> list[Offer]:
-    """Baixa um feed RSS e retorna as ofertas filtradas (título, link, data)."""
+    """Baixa um feed RSS e retorna as ofertas filtradas (id, título, link, data)."""
     content = fetch_feed(feed_url, timeout=timeout)
-    offers = parse_offers(content, keywords=keywords, limit=limit)
+    offers = parse_offers(content, programs=programs, actions=actions, limit=limit)
     logger.info("%s: %d oferta(s) relevante(s)", feed_url, len(offers))
     return offers
 
 
 def get_offers_from_feeds(
     feed_urls: Iterable[str] | None = None,
-    keywords: Iterable[str] | None = None,
+    programs: Iterable[str] | None = None,
+    actions: Iterable[str] | None = None,
     limit: int = config.MAX_ENTRIES,
     timeout: float = config.REQUEST_TIMEOUT,
 ) -> list[Offer]:
@@ -157,7 +175,7 @@ def get_offers_from_feeds(
     unique: dict[str, Offer] = {}
     for url in feed_urls or config.FEED_URLS:
         try:
-            for offer in get_offers(url, keywords, limit, timeout):
+            for offer in get_offers(url, programs, actions, limit, timeout):
                 unique.setdefault(offer["id"], offer)
         except FeedError as exc:
             logger.warning("Feed ignorado: %s", exc)

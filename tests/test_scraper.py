@@ -3,7 +3,13 @@ from datetime import datetime, timezone
 import pytest
 
 from milhas_bot import scraper
-from milhas_bot.scraper import FeedError, matches_keywords, build_keyword_pattern, normalize
+from milhas_bot.scraper import (
+    FeedError,
+    build_keyword_pattern,
+    matches_keywords,
+    matches_offer,
+    normalize,
+)
 
 SAMPLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel><title>Teste</title>
@@ -26,7 +32,18 @@ SAMPLE_RSS = """<?xml version="1.0" encoding="UTF-8"?>
     <link>https://exemplo.com/itau</link>
     <pubDate>Sun, 25 Oct 2026 09:00:00 +0000</pubDate>
   </item>
+  <item>
+    <title>Azul anuncia nova rota para Campinas</title>
+    <link>https://exemplo.com/azul-rota</link>
+  </item>
+  <item>
+    <title>Desconto de 30% em passagens para o Nordeste</title>
+    <link>https://exemplo.com/desconto-passagens</link>
+  </item>
 </channel></rss>"""
+
+PROGRAMS = build_keyword_pattern(["Livelo", "Smiles", "Itaú"])
+ACTIONS = build_keyword_pattern(["bônus", "transferência", "desconto"])
 
 
 def test_normalize_remove_acentos():
@@ -45,11 +62,21 @@ def test_nao_casa_no_meio_da_palavra():
     assert not matches_keywords("Fim do desazulamento", p)
 
 
+def test_duas_camadas_exige_programa_e_acao():
+    assert matches_offer("Livelo com bônus de 80%", PROGRAMS, ACTIONS)
+    assert not matches_offer("Livelo anuncia novo app", PROGRAMS, ACTIONS)       # só programa
+    assert not matches_offer("Bônus em passagens aéreas", PROGRAMS, ACTIONS)    # só ação
+    assert not matches_offer("Notícias do dia", PROGRAMS, ACTIONS)              # nenhuma
+
+
 def test_parse_filtra_apenas_relevantes():
     offers = scraper.parse_offers(SAMPLE_RSS)
-    titles = [o["title"] for o in offers]
-    assert len(offers) == 3
-    assert "Promoção de passagens para Lisboa" not in titles
+    links = {o["link"] for o in offers}
+    assert links == {
+        "https://exemplo.com/livelo-smiles",
+        "https://exemplo.com/esfera",
+        "https://exemplo.com/itau",
+    }
 
 
 def test_parse_campos_e_datas():
@@ -63,6 +90,11 @@ def test_parse_campos_e_datas():
 
 def test_parse_respeita_limit():
     assert len(scraper.parse_offers(SAMPLE_RSS, limit=1)) == 1
+
+
+def test_parse_aceita_programas_e_acoes_customizados():
+    offers = scraper.parse_offers(SAMPLE_RSS, programs=["Azul"], actions=["rota"])
+    assert [o["link"] for o in offers] == ["https://exemplo.com/azul-rota"]
 
 
 def test_keywords_vazias_levantam_erro():
